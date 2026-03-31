@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from sensu_mcp_server.config import Settings, configure_logging
+from sensu_mcp_server.filters import SensuFilter
 from sensu_mcp_server.sensu_client import SensuRestClient
 
 
@@ -160,6 +161,11 @@ sensu: SensuRestClient | None = None
 
         # Filter by label
         sensu_get_entities(label_selector="environment == production")
+
+    NOTE: fieldSelector and labelSelector are evaluated client-side (the server-side
+    filtering is a commercial Sensu feature). When either selector is provided, ALL
+    pages are fetched automatically and the filter is applied to the combined result,
+    so you do not need to paginate manually in that case.
     """
 )
 def sensu_get_entities(
@@ -169,15 +175,51 @@ def sensu_get_entities(
     label_selector: str | None = None,
 ) -> list[dict]:
     """Returns the list of entities in the configured Sensu namespace."""
-    params: dict[str, Any] = {"limit": limit}
+    f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
+
+    if not f.is_empty:
+        # Fetch all pages then filter client-side
+        all_entities: list[dict] = []
+        token: str | None = continue_token
+        while True:
+            params: dict[str, Any] = {"limit": limit}
+            if token:
+                params["continue"] = token
+            page = sensu.get("entities", params=params)
+            entities = page if isinstance(page, list) else page.get("items", [])
+            all_entities.extend(entities)
+            token = page.get("continue") if isinstance(page, dict) else None
+            if not token:
+                break
+        return f.apply(all_entities)
+
+    # No filter — single page, honour continue_token for manual pagination
+    params = {"limit": limit}
     if continue_token:
         params["continue"] = continue_token
-    if field_selector:
-        params["fieldSelector"] = field_selector
-    if label_selector:
-        params["labelSelector"] = label_selector
-
     return sensu.get("entities", params=params)
+
+
+@mcp.tool(
+    description="""
+    Get a single Sensu entity by exact name.
+
+    Use this instead of sensu_get_entities() when you know the entity name.
+    This is a direct API lookup — if the entity does not exist the call returns
+    a 404 error, so it also serves as an existence check.
+
+    Args:
+        entity_name: The exact name of the entity (hostname / identifier).
+                     Example: "ctr-navi4x-aj53-ws10", "db-prod-01"
+
+    Returns:
+        A single entity object with the same fields as sensu_get_entities().
+        Raises an HTTPError with status 404 if the entity does not exist.
+    """
+)
+def sensu_get_entity(entity_name: str) -> dict:
+    """Returns the entity with the given name, or raises 404 if not found."""
+    return sensu.get(f"entities/{entity_name}")
 
 
 @mcp.tool(
@@ -235,6 +277,34 @@ def sensu_get_entities(
         sensu_get_entity_events("db-prod-01")
         # → look for events where check.status != 0
 
+        # Only warning checks (status 1)
+        sensu_get_entity_events("db-prod-01", field_selector="event.check.status == 1")
+
+        # Only failing/critical checks (status 2)
+        sensu_get_entity_events("db-prod-01", field_selector="event.check.status == 2")
+
+        # Checks that are currently in a failing state
+        sensu_get_entity_events("db-prod-01", field_selector='event.check.state == "failing"')
+
+    NOTE: field_selector and label_selector are evaluated client-side. When provided,
+    all pages are fetched automatically before filtering.
+
+    Available event field paths:
+        event.check.status          (0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN)
+        event.check.state           ("passing", "failing", "flapping")
+        event.check.name
+        event.check.handlers
+        event.check.subscriptions
+        event.check.is_silenced
+        event.check.publish
+        event.check.round_robin
+        event.check.runtime_assets
+        event.entity.name
+        event.entity.entity_class
+        event.entity.subscriptions
+        event.entity.deregister
+        event.is_silenced
+
     Error codes:
         404: Entity does not exist in this namespace
         500: Internal Sensu backend error
@@ -244,12 +314,30 @@ def sensu_get_entity_events(
     entity_name: str,
     limit: Annotated[int, Field(default=50, ge=1, le=1000)] = 50,
     continue_token: str | None = None,
+    field_selector: str | None = None,
+    label_selector: str | None = None,
 ) -> list[dict]:
-    """Returns all events for the specified Sensu entity."""
-    params: dict[str, Any] = {"limit": limit}
+    """Returns all events for the specified Sensu entity, with optional client-side filtering."""
+    f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
+
+    if not f.is_empty:
+        all_events: list[dict] = []
+        token: str | None = continue_token
+        while True:
+            params: dict[str, Any] = {"limit": limit}
+            if token:
+                params["continue"] = token
+            page = sensu.get(f"events/{entity_name}", params=params)
+            events = page if isinstance(page, list) else page.get("items", [])
+            all_events.extend(events)
+            token = page.get("continue") if isinstance(page, dict) else None
+            if not token:
+                break
+        return f.apply(all_events)
+
+    params = {"limit": limit}
     if continue_token:
         params["continue"] = continue_token
-
     return sensu.get(f"events/{entity_name}", params=params)
 
 
