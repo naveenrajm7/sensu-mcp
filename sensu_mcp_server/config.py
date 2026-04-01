@@ -18,11 +18,18 @@ class Settings(BaseSettings):
     """
 
     # ===== Core Sensu Settings =====
-    sensu_url: AnyUrl
-    """Base URL of the Sensu backend (e.g., http://sensu.example.com:8080/)"""
+    sensu_url: AnyUrl | None = None
+    """Base URL of the Sensu backend. Optional when X-Sensu-URL header is supplied per-request."""
 
-    sensu_api_key: SecretStr
-    """API key for Sensu authentication (treated as secret)"""
+    sensu_api_key: SecretStr | None = None
+    """
+    Fallback API key for Sensu authentication (treated as secret).
+
+    When the server runs with Bearer auth enabled, each MCP client supplies
+    its own Sensu API key as the Bearer token, so this field is not required.
+    Set it only if you are running without Bearer auth (e.g. stdio transport
+    where there is no HTTP Authorization header).
+    """
 
     sensu_namespace: str = "default"
     """Sensu namespace to query (default: 'default')"""
@@ -64,8 +71,10 @@ class Settings(BaseSettings):
 
     @field_validator("sensu_url")
     @classmethod
-    def validate_sensu_url(cls, v: AnyUrl) -> AnyUrl:
-        """Ensure Sensu URL has a scheme and host."""
+    def validate_sensu_url(cls, v: AnyUrl | None) -> AnyUrl | None:
+        """Ensure Sensu URL has a scheme and host when provided."""
+        if v is None:
+            return v
         if not v.scheme or not v.host:
             raise ValueError(
                 "SENSU_URL must include scheme and host (e.g., http://sensu.example.com:8080/)"
@@ -129,3 +138,9 @@ def configure_logging(
     }
 
     logging.config.dictConfig(config)
+
+
+# Module-level singleton — imported by auth.py and server.py.
+# Requires SENSU_URL to be set in the environment (or a .env file).
+# server.main() may call settings._apply_cli_overrides() to layer in CLI args.
+settings = Settings()

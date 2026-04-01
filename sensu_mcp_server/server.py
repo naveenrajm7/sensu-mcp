@@ -6,9 +6,10 @@ from typing import Annotated, Any
 from fastmcp import FastMCP
 from pydantic import Field
 
-from sensu_mcp_server.config import Settings, configure_logging
+import sensu_mcp_server.config as _config_module
+from sensu_mcp_server.auth import SensuBearerAuthProvider, get_sensu_client
+from sensu_mcp_server.config import Settings, configure_logging, settings
 from sensu_mcp_server.filters import SensuFilter
-from sensu_mcp_server.sensu_client import SensuRestClient
 
 
 def parse_cli_args() -> dict[str, Any]:
@@ -91,8 +92,7 @@ def parse_cli_args() -> dict[str, Any]:
     return overlay
 
 
-mcp = FastMCP("Sensu")
-sensu: SensuRestClient | None = None
+mcp = FastMCP("Sensu", auth=SensuBearerAuthProvider())
 
 
 @mcp.tool(
@@ -175,6 +175,7 @@ def sensu_get_entities(
     label_selector: str | None = None,
 ) -> list[dict]:
     """Returns the list of entities in the configured Sensu namespace."""
+    sensu = get_sensu_client()
     f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
 
     if not f.is_empty:
@@ -219,7 +220,7 @@ def sensu_get_entities(
 )
 def sensu_get_entity(entity_name: str) -> dict:
     """Returns the entity with the given name, or raises 404 if not found."""
-    return sensu.get(f"entities/{entity_name}")
+    return get_sensu_client().get(f"entities/{entity_name}")
 
 
 @mcp.tool(
@@ -318,6 +319,7 @@ def sensu_get_entity_events(
     label_selector: str | None = None,
 ) -> list[dict]:
     """Returns all events for the specified Sensu entity, with optional client-side filtering."""
+    sensu = get_sensu_client()
     f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
 
     if not f.is_empty:
@@ -411,52 +413,85 @@ def sensu_get_entity_check_event(
     check_name: str,
 ) -> dict:
     """Returns the event for the specified entity and check."""
-    return sensu.get(f"events/{entity_name}/{check_name}")
+    return get_sensu_client().get(f"events/{entity_name}/{check_name}")
+
+
+@mcp.tool(
+    description="""
+    Execute a Sensu check on demand for a specific entity.
+
+    This is a **write** operation — it triggers an immediate check execution
+    outside the normal schedule.  Use it when self-healing has not triggered
+    or when you need a fresh result right now.
+
+    Requires a Sensu API key with sufficient permissions (typically an admin or
+    operator key).  Read-only keys will receive a 403 from Sensu.
+
+    Args:
+        entity_name: Name of the entity (host) to run the check on.
+                     Example: "server1", "db-prod-01"
+
+        check_name: Name of the check to execute.
+                    Example: "check_cpu", "check_disk", "remediate_service"
+
+                    The check must already be defined in Sensu and the entity
+                    must be subscribed to its subscription.
+
+    Returns:
+        A dict with an "issued" timestamp (Unix epoch) confirming the check
+        was queued for execution.  The check result will appear via
+        sensu_get_entity_check_event() once the agent reports back.
+
+    Error codes:
+        403: API key lacks permission to execute checks
+        404: Entity or check does not exist in this namespace
+        500: Internal Sensu backend error
+    """
+)
+def sensu_execute_check(entity_name: str, check_name: str) -> dict:
+    """Trigger an on-demand check execution for the specified entity."""
+    return get_sensu_client().post(
+        f"checks/{check_name}/execute",
+        body={"check": check_name, "subscriptions": [f"entity:{entity_name}"]},
+    )
 
 
 def main() -> None:
     """Main entry point for the MCP server."""
-    global sensu
-
     cli_overlay: dict[str, Any] = parse_cli_args()
 
-    try:
-        settings = Settings(**cli_overlay)
-    except Exception as e:
-        print(f"Configuration error: {e}", file=sys.stderr)  # noqa: T201
-        sys.exit(1)
+    # Apply CLI overrides on top of env-var-loaded settings.
+    # auth.py and tools import the module-level settings singleton, so we
+    # replace it in-place so they pick up any CLI-supplied values.
+    if cli_overlay:
+        try:
+            merged = settings.model_dump()
+            merged.update(cli_overlay)
+            _config_module.settings = Settings(**merged)
+        except Exception as e:
+            print(f"Configuration error: {e}", file=sys.stderr)  # noqa: T201
+            sys.exit(1)
 
-    configure_logging(settings.log_level)
+    effective = _config_module.settings
+    configure_logging(effective.log_level)
     logger = logging.getLogger(__name__)
 
     logger.info("Starting Sensu MCP Server")
-    logger.info(f"Effective configuration: {settings.get_effective_config_summary()}")
+    logger.info(f"Effective configuration: {effective.get_effective_config_summary()}")
 
-    if not settings.verify_ssl:
+    if not effective.verify_ssl:
         logger.warning(
             "SSL certificate verification is DISABLED. "
             "This is insecure and should only be used for testing."
         )
 
     try:
-        sensu = SensuRestClient(
-            url=str(settings.sensu_url),
-            api_key=settings.sensu_api_key.get_secret_value(),
-            namespace=settings.sensu_namespace,
-            verify_ssl=settings.verify_ssl,
-        )
-        logger.debug("Sensu client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize Sensu client: {e}")
-        sys.exit(1)
-
-    try:
-        if settings.transport == "stdio":
+        if effective.transport == "stdio":
             logger.info("Starting stdio transport")
             mcp.run(transport="stdio")
-        elif settings.transport == "http":
-            logger.info(f"Starting HTTP transport on {settings.host}:{settings.port}")
-            mcp.run(transport="http", host=settings.host, port=settings.port)
+        elif effective.transport == "http":
+            logger.info(f"Starting HTTP transport on {effective.host}:{effective.port}")
+            mcp.run(transport="http", host=effective.host, port=effective.port)
     except Exception as e:
         logger.error(f"Failed to start MCP server: {e}")
         sys.exit(1)

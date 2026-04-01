@@ -11,6 +11,9 @@ class SensuRestClient:
 
     Handles authentication via API key header and constructs namespaced
     endpoint URLs under /api/core/v2/namespaces/{namespace}/.
+
+    Each instance is scoped to one request's API key — instantiated per-request
+    via auth.get_sensu_client().
     """
 
     def __init__(self, url: str, api_key: str, namespace: str = "default", verify_ssl: bool = True):
@@ -58,3 +61,22 @@ class SensuRestClient:
         response = self.session.get(url, params=params, verify=self.verify_ssl)
         response.raise_for_status()
         return response.json()
+
+    def post(self, path: str, body: dict[str, Any]) -> Any:
+        """
+        Perform a POST request against the Sensu API.
+
+        Args:
+            path: Resource path relative to the namespace root (e.g., 'checks/check_cpu/execute')
+            body: JSON request body
+
+        Returns:
+            Parsed JSON response, or an empty dict for 202 Accepted with no body.
+
+        Raises:
+            requests.HTTPError: If the request fails (including 403 for insufficient permissions)
+        """
+        url = self._namespace_url(path)
+        response = self.session.post(url, json=body, verify=self.verify_ssl)
+        response.raise_for_status()
+        return response.json() if response.content else {}
