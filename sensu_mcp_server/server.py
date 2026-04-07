@@ -211,7 +211,7 @@ def sensu_get_entities(
 
     Args:
         entity_name: The exact name of the entity (hostname / identifier).
-                     Example: "ctr-navi4x-aj53-ws10", "db-prod-01"
+                     Example: "web-01", "db-prod-01"
 
     Returns:
         A single entity object with the same fields as sensu_get_entities().
