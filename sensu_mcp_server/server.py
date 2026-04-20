@@ -428,8 +428,9 @@ def sensu_get_entity_check_event(
     operator key).  Read-only keys will receive a 403 from Sensu.
 
     Args:
-        entity_name: Name of the entity (host) to run the check on.
-                     Example: "server1", "db-prod-01"
+        entity_names: One or more entity names (hosts) to run the check on.
+                      Each name is mapped to an entity:<name> subscription.
+                      Example: ["server1"] or ["db-prod-01", "db-prod-02"]
 
         check_name: Name of the check to execute.
                     Example: "check_cpu", "check_disk", "remediate_service"
@@ -448,11 +449,12 @@ def sensu_get_entity_check_event(
         500: Internal Sensu backend error
     """
 )
-def sensu_execute_check(entity_name: str, check_name: str) -> dict:
-    """Trigger an on-demand check execution for the specified entity."""
+def sensu_execute_check(entity_names: list[str], check_name: str) -> dict:
+    """Trigger an on-demand check execution for one or more entities."""
+    subscriptions = [f"entity:{name}" for name in entity_names]
     return get_sensu_client().post(
         f"checks/{check_name}/execute",
-        body={"check": check_name, "subscriptions": [f"entity:{entity_name}"]},
+        body={"check": check_name, "subscriptions": subscriptions},
     )
 
 
