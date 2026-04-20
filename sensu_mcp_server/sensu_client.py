@@ -62,6 +62,14 @@ class SensuRestClient:
         response.raise_for_status()
         return response.json()
 
+    def get_page(self, path: str, params: dict[str, Any] | None = None) -> tuple[Any, str | None]:
+        """Like get(), but also returns the Sensu-Continue pagination token from the response header."""
+        url = self._namespace_url(path)
+        response = self.session.get(url, params=params, verify=self.verify_ssl)
+        response.raise_for_status()
+        continue_token = response.headers.get("Sensu-Continue") or None
+        return response.json(), continue_token
+
     def post(self, path: str, body: dict[str, Any]) -> Any:
         """
         Perform a POST request against the Sensu API.

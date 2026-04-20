@@ -1,10 +1,9 @@
 import argparse
 import logging
 import sys
-from typing import Annotated, Any
+from typing import Any
 
 from fastmcp import FastMCP
-from pydantic import Field
 
 import sensu_mcp_server.config as _config_module
 from sensu_mcp_server.auth import SensuBearerAuthProvider, get_sensu_client
@@ -103,27 +102,14 @@ mcp = FastMCP("Sensu", auth=SensuBearerAuthProvider())
     or cloud instance running the Sensu agent.
 
     Args:
-        limit: Maximum number of entities to return per page (default 50, max 1000).
-               Sensu uses cursor-based pagination, not offset.
-               Start with the default; increase only if you need more results at once.
-
-        continue_token: Pagination cursor returned in the previous response's 'continue' field.
-                        Pass this to retrieve the next page of results.
-                        Leave empty (or None) to start from the first page.
-
-                        Pagination pattern:
-                          page1 = sensu_get_entities(limit=50)
-                          # if page1['continue'] is set, there are more results:
-                          page2 = sensu_get_entities(limit=50, continue_token=page1['continue'])
-
-        field_selector: Server-side field filter expression (Sensu field selector syntax).
+        field_selector: Filter expression using Sensu field selector syntax.
                         Filters on entity metadata fields. Only exact-match comparisons supported.
 
                         Examples:
                           "entity.name == server1"
                           "entity.entity_class == agent"
 
-        label_selector: Server-side label filter expression (Sensu label selector syntax).
+        label_selector: Filter expression using Sensu label selector syntax.
                         Filters entities by their metadata.labels.
 
                         Examples:
@@ -131,7 +117,7 @@ mcp = FastMCP("Sensu", auth=SensuBearerAuthProvider())
                           "environment in (production, staging)"
 
     Returns:
-        A list of entity objects. Each entity contains:
+        A complete list of all matching entity objects. Each entity contains:
         - metadata.name: The entity's unique name (hostname / identifier)
         - metadata.namespace: The namespace this entity belongs to
         - metadata.labels: Key-value labels attached to the entity
@@ -143,11 +129,6 @@ mcp = FastMCP("Sensu", auth=SensuBearerAuthProvider())
         - subscriptions: List of subscriptions this entity is enrolled in
         - last_seen: Unix timestamp of when the entity last reported in
         - sensu_agent_version: Version of the Sensu agent (agent entities only)
-
-        The response also includes a top-level 'continue' key. If non-empty, more pages exist.
-        Pass it as continue_token to retrieve the next page.
-
-        ALWAYS CHECK THE 'continue' FIELD BEFORE TELLING THE USER YOU HAVE ALL RESULTS.
 
     Common queries:
         # List all entities
@@ -162,43 +143,28 @@ mcp = FastMCP("Sensu", auth=SensuBearerAuthProvider())
         # Filter by label
         sensu_get_entities(label_selector="environment == production")
 
-    NOTE: fieldSelector and labelSelector are evaluated client-side (the server-side
-    filtering is a commercial Sensu feature). When either selector is provided, ALL
-    pages are fetched automatically and the filter is applied to the combined result,
-    so you do not need to paginate manually in that case.
+    NOTE: Filtering is evaluated client-side (server-side filtering is a commercial Sensu
+    feature). All pages are always fetched and the filter applied to the combined result.
     """
 )
 def sensu_get_entities(
-    limit: Annotated[int, Field(default=50, ge=1, le=1000)] = 50,
-    continue_token: str | None = None,
     field_selector: str | None = None,
     label_selector: str | None = None,
 ) -> list[dict]:
-    """Returns the list of entities in the configured Sensu namespace."""
+    """Returns all entities in the configured Sensu namespace."""
     sensu = get_sensu_client()
     f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
-
-    if not f.is_empty:
-        # Fetch all pages then filter client-side
-        all_entities: list[dict] = []
-        token: str | None = continue_token
-        while True:
-            params: dict[str, Any] = {"limit": limit}
-            if token:
-                params["continue"] = token
-            page = sensu.get("entities", params=params)
-            entities = page if isinstance(page, list) else page.get("items", [])
-            all_entities.extend(entities)
-            token = page.get("continue") if isinstance(page, dict) else None
-            if not token:
-                break
-        return f.apply(all_entities)
-
-    # No filter — single page, honour continue_token for manual pagination
-    params = {"limit": limit}
-    if continue_token:
-        params["continue"] = continue_token
-    return sensu.get("entities", params=params)
+    all_entities: list[dict] = []
+    token: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": 1000}
+        if token:
+            params["continue"] = token
+        entities, token = sensu.get_page("entities", params=params)
+        all_entities.extend(entities)
+        if not token:
+            break
+    return f.apply(all_entities)
 
 
 @mcp.tool(
@@ -239,72 +205,26 @@ def sensu_get_entity(entity_name: str) -> dict:
 
                      To find entity names, use sensu_get_entities() first.
 
-        limit: Maximum number of events to return per page (default 50, max 1000).
+        field_selector: Optional client-side filter expression.
+                        Example: 'event.check.state == "failing"'
 
-        continue_token: Pagination cursor from the previous response's 'continue' field.
-                        Leave empty to start from the first page.
+        label_selector: Optional client-side label filter expression.
 
     Returns:
-        A list of event objects for the specified entity. Each event contains:
+        A complete list of all event objects for the entity. Each event contains:
 
-        - id: Unique event identifier (UUID)
-        - timestamp: Unix timestamp of when the event was processed
-        - sequence: Monotonically increasing sequence number for this entity+check pair
+        - check.metadata.name: Check name (e.g., "check_cpu", "keepalive")
+        - check.status: Exit code — 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+        - check.state: "passing", "failing", or "flapping"
+        - check.output: The check's stdout output
+        - check.last_ok: Unix timestamp of the last passing result
+        - check.occurrences: How many consecutive times this result has occurred
+        - entity: Snapshot of the entity at the time of the event
+        - timestamp: When the event was processed
 
-        - check: The check result that generated this event:
-            - metadata.name: Check name (e.g., "check_cpu", "keepalive")
-            - command: The command that was executed
-            - status: Exit code — 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
-            - state: Human-readable state — "passing", "failing", "flapping"
-            - output: The check's stdout output
-            - issued / executed: Unix timestamps for when the check was scheduled and run
-            - interval: How often this check runs (seconds)
-            - occurrences: How many consecutive times this result has occurred
-            - occurrences_watermark: Peak consecutive occurrences
-            - last_ok: Unix timestamp of the last passing result
-            - history: Recent status history (last N executions)
-            - is_silenced: Whether alerts for this check are currently silenced
-
-        - entity: Snapshot of the entity at the time of the event (same fields as sensu_get_entities)
-        - pipelines: Pipelines this event was routed through (e.g., alert handlers)
-
-        ALWAYS CHECK THE 'continue' FIELD BEFORE TELLING THE USER YOU HAVE ALL RESULTS.
-
-    Common queries:
-        # Get all check results for a host
-        sensu_get_entity_events("server1")
-
-        # See if any checks are failing on a host
-        sensu_get_entity_events("db-prod-01")
-        # → look for events where check.status != 0
-
-        # Only warning checks (status 1)
-        sensu_get_entity_events("db-prod-01", field_selector="event.check.status == 1")
-
-        # Only failing/critical checks (status 2)
-        sensu_get_entity_events("db-prod-01", field_selector="event.check.status == 2")
-
-        # Checks that are currently in a failing state
-        sensu_get_entity_events("db-prod-01", field_selector='event.check.state == "failing"')
-
-    NOTE: field_selector and label_selector are evaluated client-side. When provided,
-    all pages are fetched automatically before filtering.
-
-    Available event field paths:
-        event.check.status          (0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN)
-        event.check.state           ("passing", "failing", "flapping")
-        event.check.name
-        event.check.handlers
-        event.check.subscriptions
-        event.check.is_silenced
-        event.check.publish
-        event.check.round_robin
-        event.check.runtime_assets
-        event.entity.name
-        event.entity.entity_class
-        event.entity.subscriptions
-        event.entity.deregister
-        event.is_silenced
+    Available field paths for field_selector:
+        event.check.status, event.check.state, event.check.name,
+        event.check.is_silenced, event.entity.name, event.is_silenced
 
     Error codes:
         404: Entity does not exist in this namespace
@@ -313,34 +233,23 @@ def sensu_get_entity(entity_name: str) -> dict:
 )
 def sensu_get_entity_events(
     entity_name: str,
-    limit: Annotated[int, Field(default=50, ge=1, le=1000)] = 50,
-    continue_token: str | None = None,
     field_selector: str | None = None,
     label_selector: str | None = None,
 ) -> list[dict]:
-    """Returns all events for the specified Sensu entity, with optional client-side filtering."""
+    """Returns all events for the specified Sensu entity."""
     sensu = get_sensu_client()
     f = SensuFilter(field_selector=field_selector, label_selector=label_selector)
-
-    if not f.is_empty:
-        all_events: list[dict] = []
-        token: str | None = continue_token
-        while True:
-            params: dict[str, Any] = {"limit": limit}
-            if token:
-                params["continue"] = token
-            page = sensu.get(f"events/{entity_name}", params=params)
-            events = page if isinstance(page, list) else page.get("items", [])
-            all_events.extend(events)
-            token = page.get("continue") if isinstance(page, dict) else None
-            if not token:
-                break
-        return f.apply(all_events)
-
-    params = {"limit": limit}
-    if continue_token:
-        params["continue"] = continue_token
-    return sensu.get(f"events/{entity_name}", params=params)
+    all_events: list[dict] = []
+    token: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": 1000}
+        if token:
+            params["continue"] = token
+        events, token = sensu.get_page(f"events/{entity_name}", params=params)
+        all_events.extend(events)
+        if not token:
+            break
+    return f.apply(all_events)
 
 
 @mcp.tool(
@@ -437,18 +346,21 @@ def sensu_get_entity_check_event(
         check_state: Filter by check state string.
                      One of: "passing", "failing", "flapping"
 
-        limit: Maximum number of events to fetch per page (default 100, max 1000).
-
     Returns:
-        A filtered list of event objects. Each event contains:
-        - check.metadata.name: Check name
-        - check.status: Exit code (0/1/2/3)
-        - check.state: "passing", "failing", or "flapping"
-        - check.output: Check stdout/stderr
-        - check.last_ok: Unix timestamp of last OK result
-        - check.occurrences: Consecutive identical results
-        - entity.metadata.name: Entity the check ran on
-        - timestamp: When the event was processed
+        A filtered list of projected event objects. Each object contains:
+        - entity: Entity name
+        - check: Check name
+        - status: Exit code (0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN)
+        - state: "passing", "failing", or "flapping"
+        - total_state_change: Percentage of state changes (0-100)
+        - last_ok: Unix timestamp of last OK result
+        - occurrences: Consecutive identical results
+        - max_occurrences: Peak consecutive occurrences (occurrences_watermark)
+        - issued: Unix timestamp when the check was scheduled
+        - executed: Unix timestamp when the check ran
+        - duration_ms: How long the check took in milliseconds
+        - is_silenced: Whether alerts are silenced
+        - output: Check output message
 
     Error codes:
         400: No filters provided (safety guard)
@@ -458,9 +370,8 @@ def sensu_get_entity_check_event(
 def sensu_get_events(
     entity_name: str | None = None,
     check_name: str | None = None,
-    check_status: Annotated[int | None, Field(ge=0, le=3)] = None,
+    check_status: int | None = None,
     check_state: str | None = None,
-    limit: Annotated[int, Field(default=100, ge=1, le=1000)] = 100,
 ) -> list[dict]:
     """List events with at least one required filter."""
     if entity_name is None and check_name is None and check_status is None and check_state is None:
@@ -484,16 +395,34 @@ def sensu_get_events(
     all_events: list[dict] = []
     token: str | None = None
     while True:
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": 1000}
         if token:
             params["continue"] = token
-        page = sensu.get("events", params=params)
-        events = page if isinstance(page, list) else page.get("items", [])
+        events, token = sensu.get_page("events", params=params)
         all_events.extend(f.apply(events))
-        token = page.get("continue") if isinstance(page, dict) else None
         if not token:
             break
-    return all_events
+
+    def _project(event: dict) -> dict:
+        check = event.get("check", {})
+        entity = event.get("entity", {})
+        return {
+            "entity": entity.get("metadata", {}).get("name"),
+            "check": check.get("metadata", {}).get("name"),
+            "status": check.get("status"),
+            "state": check.get("state"),
+            "total_state_change": check.get("total_state_change"),
+            "last_ok": check.get("last_ok"),
+            "occurrences": check.get("occurrences"),
+            "max_occurrences": check.get("occurrences_watermark"),
+            "issued": check.get("issued"),
+            "executed": check.get("executed"),
+            "duration_ms": round(check.get("duration", 0) * 1000),
+            "is_silenced": check.get("is_silenced"),
+            "output": check.get("output", "").strip(),
+        }
+
+    return [_project(e) for e in all_events]
 
 
 @mcp.tool(
