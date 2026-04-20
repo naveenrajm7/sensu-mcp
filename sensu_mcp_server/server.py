@@ -418,6 +418,86 @@ def sensu_get_entity_check_event(
 
 @mcp.tool(
     description="""
+    List events across all entities, with mandatory filtering to avoid flooding.
+
+    At least one of entity_name, check_name, check_status, or check_state MUST be
+    provided. Without a filter the full event list can be enormous, so this tool
+    refuses to run unfiltered.
+
+    Args:
+        entity_name: Filter to events for a specific entity (exact match).
+                     Example: "server1"
+
+        check_name: Filter to events for a specific check (exact match).
+                    Example: "check_cpu"
+
+        check_status: Filter by check exit code.
+                      0 = OK, 1 = WARNING, 2 = CRITICAL, 3 = UNKNOWN
+
+        check_state: Filter by check state string.
+                     One of: "passing", "failing", "flapping"
+
+        limit: Maximum number of events to fetch per page (default 100, max 1000).
+
+    Returns:
+        A filtered list of event objects. Each event contains:
+        - check.metadata.name: Check name
+        - check.status: Exit code (0/1/2/3)
+        - check.state: "passing", "failing", or "flapping"
+        - check.output: Check stdout/stderr
+        - check.last_ok: Unix timestamp of last OK result
+        - check.occurrences: Consecutive identical results
+        - entity.metadata.name: Entity the check ran on
+        - timestamp: When the event was processed
+
+    Error codes:
+        400: No filters provided (safety guard)
+        500: Internal Sensu backend error
+    """
+)
+def sensu_get_events(
+    entity_name: str | None = None,
+    check_name: str | None = None,
+    check_status: Annotated[int | None, Field(ge=0, le=3)] = None,
+    check_state: str | None = None,
+    limit: Annotated[int, Field(default=100, ge=1, le=1000)] = 100,
+) -> list[dict]:
+    """List events with at least one required filter."""
+    if entity_name is None and check_name is None and check_status is None and check_state is None:
+        raise ValueError(
+            "At least one filter (entity_name, check_name, check_status, or check_state) is required."
+        )
+
+    clauses: list[str] = []
+    if entity_name is not None:
+        clauses.append(f'event.entity.name == "{entity_name}"')
+    if check_name is not None:
+        clauses.append(f'event.check.name == "{check_name}"')
+    if check_status is not None:
+        clauses.append(f"event.check.status == {check_status}")
+    if check_state is not None:
+        clauses.append(f'event.check.state == "{check_state}"')
+
+    f = SensuFilter(field_selector=" && ".join(clauses))
+
+    sensu = get_sensu_client()
+    all_events: list[dict] = []
+    token: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": limit}
+        if token:
+            params["continue"] = token
+        page = sensu.get("events", params=params)
+        events = page if isinstance(page, list) else page.get("items", [])
+        all_events.extend(f.apply(events))
+        token = page.get("continue") if isinstance(page, dict) else None
+        if not token:
+            break
+    return all_events
+
+
+@mcp.tool(
+    description="""
     Execute a Sensu check on demand for a specific entity.
 
     This is a **write** operation — it triggers an immediate check execution
